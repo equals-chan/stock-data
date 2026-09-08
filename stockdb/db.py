@@ -39,6 +39,19 @@ CREATE TABLE IF NOT EXISTS financials (
     PRIMARY KEY (code, report_date)
 );
 
+CREATE TABLE IF NOT EXISTS xdxr (
+    code         TEXT,
+    xdate        TEXT,          -- 除权除息日 YYYYMMDD
+    category     INTEGER,       -- 1=除权除息 2=送配股
+    fenhong      REAL,          -- 每股现金分红（元）
+    songzhuangu  REAL,          -- 每股送转股数
+    peigu        REAL,          -- 每股配股数
+    peigujia     REAL,          -- 配股价（元）
+    suogu        REAL,          -- 缩股比例（极少见）
+    updated_at   TEXT,
+    PRIMARY KEY (code, xdate)
+);
+
 CREATE TABLE IF NOT EXISTS update_log (
     date       TEXT PRIMARY KEY,  -- YYYYMMDD
     status     TEXT,              -- ok / error
@@ -203,6 +216,48 @@ class MetaDB:
                 "INSERT OR REPLACE INTO update_log VALUES (?,?,?,?)",
                 (date_str, status, message, now)
             )
+
+    # ── 除权除息（xdxr，复权因子来源） ────────────────
+
+    def upsert_xdxr(self, code: str, events: List[dict]):
+        """写入某股票全部除权除息事件（pytdx 每次返回全量，直接覆盖）"""
+        from datetime import datetime
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows = [
+            (code, str(e["date"]).replace("-", ""),
+             e.get("category", 1),
+             float(e.get("fenhong", 0) or 0),
+             float(e.get("songzhuangu", 0) or 0),
+             float(e.get("peigu", 0) or 0),
+             float(e.get("peigujia", 0) or 0),
+             float(e.get("suogu", 0) or 0),
+             now)
+            for e in events
+        ]
+        with self._conn() as conn:
+            # pytdx 每次返回全量历史，先删后插避免残留旧行
+            conn.execute("DELETE FROM xdxr WHERE code=?", (code,))
+            conn.executemany(
+                "INSERT INTO xdxr VALUES (?,?,?,?,?,?,?,?,?)", rows
+            )
+        logger.info("Upserted %d xdxr events for %s", len(rows), code)
+
+    def get_xdxr(self, code: str) -> pd.DataFrame:
+        """读取某股票全部除权除息事件，按日期升序"""
+        with self._conn() as conn:
+            df = pd.read_sql_query(
+                "SELECT * FROM xdxr WHERE code=? ORDER BY xdate", conn, params=(code,)
+            )
+        if not df.empty:
+            df["xdate"] = pd.to_datetime(df["xdate"], format="%Y%m%d", errors="coerce")
+        return df
+
+    def has_xdxr(self, code: str) -> bool:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM xdxr WHERE code=? LIMIT 1", (code,)
+            ).fetchone()
+        return row is not None
 
     # ── 筹码分布选股与状态 ─────────────────────────────────
 

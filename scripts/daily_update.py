@@ -112,6 +112,9 @@ def is_trade_day(meta: MetaDB, date_str: str) -> bool:
 # 并发连接数（每个 worker 独立持一条 TDX TCP 连接）
 CONCURRENT_WORKERS = 8
 
+# 本次运行实际写入数据的股票（用于后续增量刷新除权除息事件）
+UPDATED_CODES = set()
+
 
 def _peek_last_date(parquet_path) -> str:
     """
@@ -203,6 +206,7 @@ def _update_one(args) -> bool:
         return False
 
     _append_parquet(parquet_path, new_df, dedup_col="date")
+    UPDATED_CODES.add(code)
     return True
 
 
@@ -269,6 +273,7 @@ def _bulk_update_from_spot(cfg: Config, date_str: str) -> int:
         if new_df["close"].isna().all():
             return False
         _append_parquet(parquet_path, new_df, dedup_col="date")
+        UPDATED_CODES.add(code)
         return True
 
     updated = 0
@@ -437,6 +442,29 @@ def update_indices(cfg: Config, date_str: str):
                 logger.info("Index %s (%s) ✅", code, name)
         except Exception as e:
             logger.warning("Index %s failed: %s", code, e)
+
+
+# ── 除权除息事件刷新（复权因子数据源） ───────────────
+
+def update_xdxr(cfg: Config, meta: MetaDB):
+    """刷新本次更新过的股票的除权除息事件（xdxr 表，前复权因子数据源）"""
+    if not UPDATED_CODES:
+        logger.info("无新增数据股票，跳过 xdxr 刷新")
+        return
+    from stockdb.adj import fetch_xdxr_events
+
+    logger.info("刷新 %d 只股票的除权除息事件...", len(UPDATED_CODES))
+    ok = 0
+    try:
+        with tdx_connect(cfg.servers) as api:
+            for code in sorted(UPDATED_CODES):
+                events = fetch_xdxr_events(code, cfg.servers, api=api)
+                if events:
+                    meta.upsert_xdxr(code, events)
+                    ok += 1
+    except Exception as e:
+        logger.warning("xdxr 刷新失败: %s", e)
+    logger.info("xdxr 刷新完成：%d 只", ok)
 
 
 # ── 分钟线主动沉淀与增量沉淀 ─────────────────────────
@@ -649,6 +677,12 @@ def main():
         logger.info("=" * 50)
         logger.info("✅ 日线更新完成！共补齐 %d 只 A 股数据", n)
         logger.info("=" * 50)
+
+        # 5.1 除权除息事件刷新（复权因子数据源）
+        try:
+            update_xdxr(cfg, meta)
+        except Exception as e:
+            logger.warning("除权除息事件刷新失败: %s", e)
     else:
         logger.info("✅ %s 日线数据已是最新，无需更新。", date_str)
 

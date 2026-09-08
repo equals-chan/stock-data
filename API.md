@@ -62,6 +62,9 @@ df = db.daily('300661')                        # 全部历史（5年）
 df = db.daily('300661', start='2025-01-01')    # 指定起始日期
 df = db.daily('600519', start='2024-01-01', end='2024-12-31')  # 区间
 
+# 前复权（ML 训练 / 回测建议使用）
+df = db.daily('600519', adjust='qfq')
+
 # 返回列：date(datetime64), open, high, low, close, vol, amount(float)
 print(df.tail())
 #         date   open   high    low  close      vol       amount
@@ -71,8 +74,9 @@ print(df.tail())
 **注意事项：**
 
 - `code` 不带交易所前缀，直接传 6 位数字代码
-- 数据为**不复权**原始价格（来自通达信）
-- 如需前复权（建议 ML 训练使用），需自行用复权因子处理（后续版本将支持 `adjust='qfq'`）
+- 默认（`adjust='none'`）返回**不复权**原始价格（来自通达信）
+- `adjust='qfq'` 返回**前复权**价格：由 pytdx 除权除息事件（`get_xdxr_info`）+ 本地原始日线离线计算因子（算法与通达信一致），最新交易日因子=1（最新价=真实价），`vol`/`amount` 不受影响
+- 复权因子缓存在 `data/adj/{code}.parquet`；xdxr 事件存于 `meta.db` 的 `xdxr` 表，首次调用自动拉取，`daily_update.py` 每日增量刷新
 - 本地无数据时自动拉取 pytdx，拉取后存盘，下次毫秒级
 
 **批量读取多只股票：**
@@ -397,7 +401,7 @@ def get_tick_flow(code: str, date: str = None):
 ## 常见问题
 
 **Q: 数据是否复权？**  
-A: 日线数据为不复权原始价格（来自通达信）。若用于 ML 训练，建议等待 `adjust='qfq'` 参数支持，或自行计算。
+A: 默认（`adjust='none'`）为不复权原始价格（来自通达信）。`db.daily(code, adjust='qfq')` 可返回前复权价：复权因子由 pytdx 除权除息事件离线计算（算法与通达信一致，最新交易日因子=1），缓存于 `data/adj/{code}.parquet`，xdxr 事件存于 `meta.db` 的 `xdxr` 表。ML 训练 / 回测建议使用前复权。
 
 **Q: 为什么有些股票行数很少（<50行）？**  
 A: TDX 整包含债券、ETF 等非股票品种，这些数据少是正常的。实际 A 股主板股票应有 1200+ 行。

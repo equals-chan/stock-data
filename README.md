@@ -13,6 +13,7 @@
 
 ### A 股（`StockDB`）
 - **日线**：全市场 5200 只，5 年历史，本地 Parquet，毫秒级读取
+- **前复权**：`db.daily(adjust='qfq')` 离线因子计算（pytdx 除权除息事件），ML 训练推荐
 - **分钟线**：写透缓存，首次拉取自动存盘，越用越快
 - **Tick**：当日实时，可配置保留最近 N 天历史
 - **每日自动补充**：每个交易日 16:30 后自动更新所有数据
@@ -66,6 +67,15 @@ python3 scripts/init_full.py
 
 下载完整 ZIP，一次性补全所有历史（无论缺失多少天）。
 
+### A 股：前复权数据源（可选，一次性）
+
+```bash
+python3 scripts/init_xdxr.py   # 全量回填除权除息事件（xdxr 表）
+```
+
+- 不跑也不影响使用：`db.daily(code, adjust='qfq')` 首次调用会自动按需拉取
+- 跑一次后全市场前复权均可离线秒出；日常由 `daily_update.py` 自动增量刷新
+
 ### 美股：初始化 & 每日更新（完全独立，不影响 A 股）
 
 ```bash
@@ -95,7 +105,7 @@ db = StockDB()
 
 | 方法 | 说明 | 示例 |
 |---|---|---|
-| `db.daily(code, start, end)` | 日线 K 线（全市场，本地 Parquet，成交量单位统一为”股”） | `db.daily('300661', start='2024-01-01')` |
+| `db.daily(code, start, end)` | 日线 K 线（全市场，本地 Parquet，成交量单位统一为"股"；`adjust='qfq'` 返回前复权价） | `db.daily('300661', start='2024-01-01')` |
 | `db.minutes(code, date, days)` | 分钟线（支持懒缓存与 `watchlist` 主动增量更新，防 100 天断档） | `db.minutes('300661', date='20260507')` |
 | `db.tick(code, date)` | Tick 逐笔（实时/历史缓存） | `db.tick('300661')` |
 | `db.index(code, start, end)` | 指数日线 | `db.index('000001')` |
@@ -106,6 +116,21 @@ db = StockDB()
 - `code`：股票代码，不带市场前缀（如 `'300661'`、`'600000'`）
 - `market`：`'SH'` / `'SZ'` / `'BJ'` / `None`（全部）
 - `start` / `end`：日期字符串 `'YYYY-MM-DD'`，可省略
+- `adjust`：`'none'`（默认，不复权原始价） / `'qfq'`（前复权，ML 训练推荐）
+
+**前复权说明**：复权因子由 pytdx 除权除息事件（`get_xdxr_info`）+ 本地原始日线离线计算（算法与通达信一致），最新交易日因子=1（最新价=真实价），新除权只影响更早历史。事件存于 `meta.db` 的 `xdxr` 表，因子缓存于 `data/adj/{code}.parquet`。首次接入可运行 `python3 scripts/init_xdxr.py` 全量回填（或由 `db.daily(adjust='qfq')` 按需自动拉取）。
+
+#### A 股前复权（qfq）详解
+
+```python
+df = db.daily('600519', adjust='qfq')   # 前复权 OHLC，vol/amount 不变
+```
+
+- **存储不动**：Parquet 永远存不复权原始价；前复权 = 原始价 × 运行时因子，默认 `adjust='none'` 对现有项目零影响
+- **算法**（与通达信一致）：每个除权事件理论除权价 `T = (前收 − 每股分红 + 配股价×每股配股率) / (1 + 每股送转率 + 每股配股率)`，乘数 `k = T / 前收`；`factor(某日) = ∏ k`（所有该日之后的事件），最新交易日因子=1
+- **数据流**：`pytdx get_xdxr_info`（全历史事件）→ `meta.db` 的 `xdxr` 表（先删后插）→ 因子计算 → 缓存 `data/adj/{code}.parquet`（失效条件：日线更新 / xdxr 更新）
+- **维护**：`daily_update.py` 每日自动刷新被更新股票的 xdxr；`init_xdxr.py` 全量回填
+- **已知边界**：缩股（suogu）事件暂不支持（A 股极少见）；分钟线 / Tick 不复权
 
 ### 美股 `USStockDB`（独立模块，与 A 股零耦合）
 
@@ -199,6 +224,7 @@ stock-data/
 │       └── reader.py       # USStockDB 门面（本地 Parquet 优先 + 写透缓存）
 ├── scripts/
 │   ├── init_full.py        # A 股全量初始化（首次运行）
+│   ├── init_xdxr.py        # 全量回填除权除息事件（复权因子数据源）
 │   ├── daily_update.py     # A 股每日增量更新
 │   ├── us_update.py        # 美股更新（独立，与 daily_update.py 互不干扰）
 │   ├── fix_daily_volume.py # 一键纠正个股成交量”手/股”单位修复脚本
@@ -210,9 +236,10 @@ stock-data/
 │   │   └── us/AXTI.parquet     # 美股日线（独立目录）
 │   ├── minutes/            # A 股分钟线（懒缓存，按需积累）
 │   ├── index/              # A 股指数日线
+│   ├── adj/                # A 股前复权因子缓存（{code}.parquet）
 │   └── tick/               # A 股 Tick 缓存
 ├── db/
-│   └── meta.db             # SQLite：A 股表（stocks/trade_calendar/...）
+│   └── meta.db             # SQLite：A 股表（stocks/trade_calendar/xdxr/...）
 │                           #        + 美股表（us_stocks/us_splits/us_financials/us_calendar）
 ├── tests/
 │   └── test_us_data.py     # 美股黄金样本断言（AXTI/NIVF）
@@ -271,6 +298,9 @@ python3 scripts/daily_update.py --force
 **Q: 没有网络时能用吗？**  
 A: 日线完全可用（本地 Parquet）；分钟线和 Tick 如果之前拉取过并缓存，也可离线使用。
 
+**Q: 数据是否复权？**  
+A: 日线默认（`adjust='none'`）为不复权原始价（来自通达信）。`db.daily(code, adjust='qfq')` 返回前复权价：因子由 pytdx 除权除息事件离线计算（算法与通达信一致），最新交易日因子=1。ML 训练 / 回测建议使用前复权。
+
 **Q: 数据占多少空间？**  
 A: 全市场日线 5 年约 500MB，ZIP 缓存约 500MB，分钟线/Tick 按需积累。
 
@@ -304,7 +334,7 @@ A: 有两种方案：
 
 ---
 
-## 技术维护备忘与高阶避坑经验（2026-05-23 重构记）
+## 技术维护备忘与高阶避坑经验（2026-05-23 重构记 / 2026-08-22 复权模块补记）
 
 在开发与迭代增量同步系统时，我们总结沉淀了以下极具系统健壮性价值的避坑方案：
 
@@ -327,4 +357,9 @@ A: 有两种方案：
 ### 4. 停牌股误报警与退市个股性能过滤
 - **停牌股处理**：如果个股长期停牌，单纯按自然日跨度计算更新相差天数（如 $\ge 100$ 天）会持续报错 `CRITICAL` 并频繁向网络发起无用查询。我们将其优化为 **“分钟线最新日期与本地日线最新日期对齐过滤”** 逻辑：若停牌期间分钟线与日线均保持在停牌前最后一天（`last_date >= last_daily_date`），说明数据已是当前最新交易状态，不做报警和无意义网络查询，完全遵循市场客观交易事实。
 - **退市股处理**：在日线增量和分钟线同步前，从 SQLite 过滤已退市股票名单并从拉取列表移除，防止为已退市股票发起成百上千次无效网络请求，实现了极佳的性能累积优化。
+
+### 5. A 股前复权因子的两个数据坑（2026-08 复权模块落地记）
+- **TDX xdxr 字段是“每 10 股”口径**：`fenhong / songzhuangu / peigu` 均为每 10 股数值（如 10送5 → `songzhuangu=5.0`，每10股派5元 → `fenhong=5.0`），`peigujia`（配股价）才是每股价格。若按“每股”口径直接用，茅台（fenhong=216.75）的因子会被算小约 10 倍，前复权序列整体失真。方案：计算时统一 ÷10 换算为每股口径，并用除权日实际开盘价 vs 理论除权价实证校验（如圣邦 10送5派5：理论价 (256.58−0.5)/1.5=170.72 ≈ 实际开盘 171.12 ✓）。
+- **同日 cat=1 与 cat=5 事件主键互覆**：同一除权日 TDX 同时返回 cat=1（除权除息，含真实参数）与 cat=5（股本变化，全零）两条记录，两者日期相同在 `(code, xdate)` 主键下 `INSERT OR REPLACE` 会互相覆盖，导致真实事件被全零行顶掉（圣邦 2022-06-22 的 10送5 事件曾因此丢失）。方案：`fetch_xdxr_events` 按日期去重、优先保留 cat=1/2，`upsert_xdxr` 改为先删后插（pytdx 每次返回全量）。
+- **验证基线**：与 yfinance 前复权序列比对，600519 平均偏差 0.0018%、000858 0.0001%、300661 0.0455%（残差为含税/除税口径差异）；全市场抽查无人工断层（除权日 |涨跌| > 30% 的天数为 0）。
 

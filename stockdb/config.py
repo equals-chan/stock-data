@@ -102,6 +102,10 @@ class Config:
     def index_path(self, code: str) -> Path:
         return self.data_dir / "index" / f"{code}.parquet"
 
+    def adj_path(self, code: str) -> Path:
+        """前复权因子缓存路径（不区分市场，直接按代码存放）"""
+        return self.data_dir / "adj" / f"{code}.parquet"
+
     # ── 美股配置（只读，不影响 A 股任何属性）────────────
 
     @property
@@ -127,7 +131,7 @@ class Config:
     def ensure_dirs(self):
         """创建所有必要目录"""
         for sub in ("daily/sh", "daily/sz", "daily/bj",
-                    "minutes", "tick", "index"):
+                    "minutes", "tick", "index", "adj"):
             (self.data_dir / sub).mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)

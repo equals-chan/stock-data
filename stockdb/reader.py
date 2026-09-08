@@ -119,10 +119,14 @@ class StockDB:
         start: Optional[str] = None,
         end: Optional[str] = None,
         force_refresh: bool = False,
+        adjust: str = "none",
     ) -> pd.DataFrame:
         """
         读日线 OHLCV。全市场可用，本地 Parquet 优先。
         首次调用若本地无数据，或 force_refresh=True 时，从 pytdx 拉取并存盘。
+
+        adjust: 'none'（默认，原始不复权价）| 'qfq'（前复权）
+        复权因子由除权除息事件离线计算，最新交易日因子=1（最新价=真实价）。
         """
         code = normalize_code(code)
         path = self.cfg.daily_path(code)
@@ -136,6 +140,12 @@ class StockDB:
                 _append_parquet(path, df, dedup_col="date")
                 df = pd.read_parquet(path)
 
+        # 前复权：基于全量历史计算因子，再过滤日期区间
+        if adjust == "qfq" and not df.empty:
+            factors = self._get_qfq_factors(code, df)
+            from .adj import apply_qfq
+            apply_qfq(df, factors)
+
         # 日期过滤
         if "date" in df.columns:
             if start:
@@ -144,6 +154,55 @@ class StockDB:
                 df = df[df["date"] <= pd.to_datetime(end)]
 
         return df.reset_index(drop=True)
+
+    def _get_qfq_factors(self, code: str, daily_df: pd.DataFrame) -> pd.Series:
+        """
+        读取/计算某股票前复权因子（缓存在 data/adj/{code}.parquet）。
+
+        缓存失效条件：
+          1. 本地日线比缓存新（有新交易日）
+          2. xdxr 事件表比缓存新（有新除权除息事件）
+          3. 缓存文件不存在
+        """
+        from .adj import compute_qfq_factors, fetch_xdxr_events
+
+        if daily_df.empty:
+            return pd.Series(dtype=float)
+
+        cache = self.cfg.adj_path(code)
+        daily_max = daily_df["date"].max()
+
+        # 读取 xdxr 事件表（本地优先，缺失时网络拉取一次写透）
+        if not self._meta.has_xdxr(code):
+            logger.info("xdxr cache miss %s, fetching from pytdx...", code)
+            events = fetch_xdxr_events(code, self.cfg.servers)
+            self._meta.upsert_xdxr(code, events)
+        ev_df = self._meta.get_xdxr(code)
+        ev_ts = ev_df["updated_at"].max() if not ev_df.empty else None
+
+        # 缓存命中判断
+        if cache.exists():
+            try:
+                cached = pd.read_parquet(cache)
+                if not cached.empty and cached["date"].max() >= daily_max:
+                    mtime = datetime.fromtimestamp(cache.stat().st_mtime)
+                    fresh = True
+                    if ev_ts:
+                        ev_dt = pd.to_datetime(ev_ts)
+                        fresh = ev_dt <= mtime
+                    if fresh:
+                        return cached.set_index("date")["factor"].reindex(daily_df["date"]).fillna(1.0)
+            except Exception as e:
+                logger.warning("adj cache read failed %s: %s", code, e)
+
+        factors = compute_qfq_factors(daily_df, ev_df)
+        out = pd.DataFrame({"date": daily_df["date"], "factor": factors.values})
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            out.to_parquet(cache, index=False)
+        except Exception as e:
+            logger.warning("adj cache write failed %s: %s", code, e)
+        return factors
 
     # ── 分钟线（写透缓存） ────────────────────────────
 
@@ -480,13 +539,13 @@ class StockDB:
     # ── 内部：akshare 兜底 ───────────────────────────
 
     def _fallback_daily(self, code: str) -> pd.DataFrame:
-        """pytdx 失败时用 akshare 兜底"""
+        """pytdx 失败时用 akshare 兜底（不复权，与主链路保持一致）"""
         try:
             import akshare as ak
             logger.info("fallback to akshare for %s", code)
             df = ak.stock_zh_a_hist(
                 symbol=code, period="daily",
-                adjust="qfq", start_date="2019-01-01"
+                adjust="", start_date="2019-01-01"
             )
             # 标准化列名
             col_map = {
