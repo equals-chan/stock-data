@@ -139,6 +139,21 @@ class MetaDB:
             conn.executemany(sql, rows)
         logger.info("Upserted %d stocks", len(rows))
 
+    def update_stock_names(self, name_map: dict):
+        """只更新已有股票的名称（保留 board/industry/股本等其它字段）。
+
+        名称会随 ST/更名/除权前缀（XD/XR/DR）变化，需每日同步；
+        新上市股票仍由 init_full 负责补录。
+        """
+        from datetime import datetime
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows = [(name, now, code) for code, name in name_map.items() if name]
+        if not rows:
+            return
+        with self._conn() as conn:
+            conn.executemany("UPDATE stocks SET name=?, updated_at=? WHERE code=?", rows)
+        logger.info("Updated names for %d stocks", len(rows))
+
     def update_stock_shares_data(self, shares_dict: dict):
         """
         批量更新股票的流通股本和自由流通股本

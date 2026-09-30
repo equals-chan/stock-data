@@ -21,7 +21,7 @@ from stockdb.config import Config
 from stockdb.db import MetaDB
 from stockdb.market import INDEX_MAP, code_to_tdx_market
 from stockdb.reader import _bars_to_df, _append_parquet, StockDB, fetch_minutes_from_web, disable_proxy
-from stockdb.tdx_client import tdx_connect
+from stockdb.tdx_client import tdx_connect, fetch_security_list
 
 # ── 日志 ─────────────────────────────────────────────
 
@@ -490,6 +490,32 @@ def update_indices(cfg: Config, date_str: str):
             logger.warning("Index %s failed: %s", code, e)
 
 
+# ── 股票名称同步 ─────────────────────────────────────
+
+def sync_stock_names(cfg: Config, meta: MetaDB):
+    """从 TDX 证券列表刷新股票名称。
+
+    名称会随 ST 摘帽/戴帽、公司更名、除权前缀（XD/XR/DR）变化；init_full 只在
+    初始化时写一次，若不每日同步会把"XD紫金矿"这类当日前缀永久冻结。
+    北交所新协议不返回列表，沿用旧名。
+    """
+    names = {}
+    try:
+        with tdx_connect(cfg.servers) as api:
+            for market_int in (1, 0):  # sh, sz
+                for s in fetch_security_list(api, market_int):
+                    code = str(s.get("code", "")).zfill(6)
+                    nm = (s.get("name") or "").strip()
+                    if nm and A_SHARE_RE.match(code):
+                        names[code] = nm
+    except Exception as e:
+        logger.warning("股票名称同步失败: %s", e)
+        return
+    if names:
+        meta.update_stock_names(names)
+        logger.info("股票名称同步完成：%d 只", len(names))
+
+
 # ── 除权除息事件刷新（复权因子数据源） ───────────────
 
 def update_xdxr(cfg: Config, meta: MetaDB):
@@ -737,6 +763,12 @@ def main():
         update_minutes(cfg, date_str, meta)
     except Exception as e:
         logger.warning("分钟线增量沉淀失败: %s", e)
+
+    # 5.5 股票名称同步（ST 摘帽/更名/除权前缀每日变化）
+    try:
+        sync_stock_names(cfg, meta)
+    except Exception as e:
+        logger.warning("股票名称同步失败: %s", e)
 
     # 6. Tick 清理
     try:

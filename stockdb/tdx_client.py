@@ -86,16 +86,32 @@ def fetch_bars_date_range(api, code: str, market: int, frequency: int,
 
 
 def fetch_security_list(api, market: int) -> list:
-    """拉取某市场全部股票列表（循环直到取完）"""
+    """拉取某市场全部证券列表（循环直到取完）。
+
+    注意：新协议下沪市 market=1 的 offset < ~999 页返回空（服务器行为），
+    旧实现遇到空批直接 break，会导致**整个沪市列表为空**；这里按
+    get_security_count 推进 offset，空页跳过而不中断。
+    """
     all_stocks, offset = [], 0
-    while True:
+    try:
+        total = int(api.get_security_count(market) or 0)
+    except Exception:
+        total = 0
+    # 无 count 时给一个安全上限，避免死循环
+    limit = (total + 1000) if total else 100000
+    empty_streak = 0
+    while offset < limit:
         batch = api.get_security_list(market, offset)
-        if not batch:
+        if batch:
+            all_stocks.extend(batch)
+            empty_streak = 0
+        else:
+            empty_streak += 1
+            if not total and empty_streak > 3:
+                break
+        offset += 1000
+        if total and offset >= total:
             break
-        all_stocks.extend(batch)
-        if len(batch) < 1000:
-            break
-        offset += len(batch)
     return all_stocks
 
 
