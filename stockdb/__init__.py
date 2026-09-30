@@ -10,6 +10,11 @@ for _k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"
     if _k in os.environ and os.environ[_k] == "":
         del os.environ[_k]
 
+# 2026-09 通达信新协议兼容（就地 patch pytdx，必须在任何 pytdx 使用前生效）
+from . import tdx_compat as _tdx_compat
+
+_tdx_compat.apply_patches()
+
 from .reader import StockDB
 
 __version__ = "0.1.0"

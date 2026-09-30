@@ -28,6 +28,24 @@
 
 ---
 
+## ⚠️ 2026-09 通达信协议变更（已适配）
+
+2026-09-10 起通达信服务器拒绝旧 pytdx/mootdx 握手：TCP 能连、`get_security_list`
+之类小命令仍有响应，但 **K 线/报价/逐笔等行情命令全部返回空** —— 若不处理，
+`daily_update.py` 会每天记录 "ok" 却只更新极少数股票，造成**静默停更**。
+
+本项目通过 `stockdb/tdx_compat.py` 在包导入时就地 patch pytdx（`stockdb/__init__.py`
+自动调用），**无需改动任何调用方**：
+- 连接握手改为 `0c02`(init) + `0c03`(tdxlevel 认证)；
+- K 线（日线/分钟/指数）请求版本标识 `0x01016408` → `0x01007b18`。
+
+其余命令（quotes / xdxr / finance / tick / security_list）在新握手下原样可用。
+逆向细节参考 [ShanNing-YU/a-share-tdxdata](https://github.com/ShanNing-YU/a-share-tdxdata)（MIT）。
+
+已知限制：新服务器**暂不返回北交所（4/8/92）**行情（BJ 市场增量会全失败，属预期）。
+
+---
+
 ## 快速开始
 
 ### 安装依赖

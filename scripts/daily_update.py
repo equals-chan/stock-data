@@ -205,6 +205,13 @@ def _update_one(args) -> bool:
     if new_df.empty:
         return False
 
+    # pytdx / akshare 日线成交量单位为“手”，stockdb 统一存“股”
+    # （akshare 全市场快照路径已 ×100；pytdx 路径此前漏乘，导致两条路径单位不一致，
+    #  再现症状：停机后走 pytdx 补数会把近端 vol 写成手，破坏与历史股的比率）
+    if "vol" in new_df.columns:
+        new_df = new_df.copy()
+        new_df["vol"] = new_df["vol"] * 100.0
+
     _append_parquet(parquet_path, new_df, dedup_col="date")
     UPDATED_CODES.add(code)
     return True
@@ -357,6 +364,22 @@ def incremental_update(cfg: Config, date_str: str, n_bars: int) -> int:
             logger.info("[%s] 全部已是最新，跳过", market_str.upper())
             continue
 
+        # 实际缺失条数按文件最新日期计算（update_log 可能因历史静默失败而失真：
+        # 曾出现每天记 ok 但文件停在数周前的情形，若只拉 n_bars 会留下空洞）
+        stale = [d for d in (_peek_last_date(f) for f in need_update) if d]
+        oldest = min(stale) if stale else ""
+        gap_days = 0
+        if oldest:
+            try:
+                gap_days = (datetime.strptime(date_str, "%Y%m%d")
+                            - datetime.strptime(oldest, "%Y%m%d")).days
+            except Exception:
+                gap_days = 0
+        market_n_bars = max(n_bars, min(gap_days * 2 + 5, 300))
+        if market_n_bars != n_bars:
+            logger.info("[%s] 实际缺失 %d 天（最旧文件 %s），本次拉取 %d 条",
+                        market_str.upper(), gap_days, oldest, market_n_bars)
+
         # 建立 CONCURRENT_WORKERS 条独立 TDX 连接
         apis = []
         try:
@@ -394,7 +417,7 @@ def incremental_update(cfg: Config, date_str: str, n_bars: int) -> int:
                 futures = {
                     pool.submit(
                         _update_one,
-                        (pick_api(), p, market_int, n_bars, cutoff, date_str)
+                        (pick_api(), p, market_int, market_n_bars, cutoff, date_str)
                     ): p
                     for p in need_update
                 }
@@ -415,6 +438,12 @@ def incremental_update(cfg: Config, date_str: str, n_bars: int) -> int:
                     pass
 
         logger.info("[%s] 完成: 更新 %d 只，失败 %d", market_str.upper(), updated, failed)
+        if need_update and updated == 0:
+            logger.error("[%s] ⚠️ 全部拉取失败（%d 只）——检查 TDX 协议/网络，勿视为成功",
+                         market_str.upper(), len(need_update))
+        elif failed > updated:
+            logger.warning("[%s] ⚠️ 失败数(%d) 超过成功数(%d)，数据可能不完整",
+                           market_str.upper(), failed, updated)
         total += updated
 
     return total
@@ -428,18 +457,35 @@ def update_indices(cfg: Config, date_str: str):
         path = cfg.index_path(code)
         market_int = 1 if market_str == "sh" else 0
         try:
+            # 根据本地最后一个交易日决定拉取条数（停机数日后需补齐中间缺失，
+            # 旧实现固定 10 条 + 只留 >= date_str，会造成指数序列出现日期空洞）
+            last_local = ""
+            if path.exists():
+                try:
+                    old = pd.read_parquet(path, columns=["date"])
+                    if not old.empty:
+                        last_local = pd.to_datetime(old["date"]).max().strftime("%Y%m%d")
+                except Exception:
+                    last_local = ""
+            count = 30
+            if last_local:
+                try:
+                    gap = (datetime.strptime(date_str, "%Y%m%d")
+                           - datetime.strptime(last_local, "%Y%m%d")).days
+                    count = max(30, min(gap * 2 + 10, 800))
+                except Exception:
+                    count = 30
             with tdx_connect(cfg.servers) as api:
                 # 指数必须用 get_index_bars()，get_security_bars() 会返回乱码
-                data = api.get_index_bars(9, market_int, code, 0, 10)
+                data = api.get_index_bars(9, market_int, code, 0, count)
             if not data:
                 continue
             df = _bars_to_df(data, freq="daily")
             if df.empty:
                 continue
-            df = df[df["date"].dt.strftime("%Y%m%d") >= date_str]
-            if not df.empty:
-                _append_parquet(path, df, dedup_col="date")
-                logger.info("Index %s (%s) ✅", code, name)
+            # 直接全部 append（_append_parquet 按 date 去重），可补齐中间空洞
+            _append_parquet(path, df, dedup_col="date")
+            logger.info("Index %s (%s) ✅ (%d 条)", code, name, len(df))
         except Exception as e:
             logger.warning("Index %s failed: %s", code, e)
 
